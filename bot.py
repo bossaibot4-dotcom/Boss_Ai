@@ -51,10 +51,18 @@ def init_database():
     conn.execute("CREATE TABLE IF NOT EXISTS payments (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, amount INTEGER, status TEXT DEFAULT 'pending', created_at INTEGER)")
     conn.execute("CREATE TABLE IF NOT EXISTS feedback (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, rating TEXT, created_at INTEGER)")
 
-    # Safe migration: add notes column if this is an older database file.
+    # Safe migration: add columns if this is an older database file.
     existing_columns = [row["name"] for row in conn.execute("PRAGMA table_info(users)").fetchall()]
     if "notes" not in existing_columns:
         conn.execute("ALTER TABLE users ADD COLUMN notes TEXT DEFAULT ''")
+    if "last_active" not in existing_columns:
+        conn.execute("ALTER TABLE users ADD COLUMN last_active INTEGER")
+    if "reminder_sent_at" not in existing_columns:
+        conn.execute("ALTER TABLE users ADD COLUMN reminder_sent_at INTEGER")
+    if "total_messages" not in existing_columns:
+        conn.execute("ALTER TABLE users ADD COLUMN total_messages INTEGER DEFAULT 0")
+    if "channel_verified" not in existing_columns:
+        conn.execute("ALTER TABLE users ADD COLUMN channel_verified INTEGER DEFAULT 0")
     conn.commit()
     conn.close()
 
@@ -79,6 +87,15 @@ def get_user(user_id, first_name="", username=""):
         conn.commit()
         user = conn.execute("SELECT * FROM users WHERE user_id=?", (user_id,)).fetchone()
 
+    # Touch activity on every interaction, and clear any pending inactivity reminder
+    # flag so a fresh idle timer starts the next time they go quiet.
+    conn.execute(
+        "UPDATE users SET last_active=?, reminder_sent_at=NULL WHERE user_id=?",
+        (int(time.time()), user_id)
+    )
+    conn.commit()
+    user = conn.execute("SELECT * FROM users WHERE user_id=?", (user_id,)).fetchone()
+
     conn.close()
     return user
 
@@ -101,10 +118,59 @@ def main_keyboard(user_id=None):
     markup.row(KeyboardButton("🤖 Models"), KeyboardButton("🔄 Restart"))
     markup.row(KeyboardButton("❓ Help"), KeyboardButton("📊 My Account"))
     markup.row(KeyboardButton("🎨 Create Image"), KeyboardButton("🎵 Create Music"))
-    markup.row(KeyboardButton("📄 Create Document"), KeyboardButton("🧠 My Memory"))
+    markup.row(KeyboardButton("🎬 Create Video"), KeyboardButton("📄 Create Document"))
+    markup.row(KeyboardButton("🧠 My Memory"))
     if user_id is not None and ADMIN_ID != 0 and user_id == ADMIN_ID:
-        markup.row(KeyboardButton("👑 Admin Panel"))
+        markup.row(KeyboardButton("👑 Admin Panel"), KeyboardButton("📢 Broadcast"))
     return markup
+
+
+def mode_keyboard():
+    markup = ReplyKeyboardMarkup(resize_keyboard=True)
+    markup.row(KeyboardButton("🔙 Back to Chat"))
+    return markup
+
+
+CHANNEL_USERNAME = "@bossainews"
+CHANNEL_JOIN_THRESHOLD = 10
+
+
+def has_joined_channel(user_id):
+    try:
+        member = bot.get_chat_member(CHANNEL_USERNAME, user_id)
+        return member.status in ("member", "administrator", "creator")
+    except Exception as error:
+        # If the check itself fails (bot not admin, transient API error), don't
+        # block real users because of an infrastructure hiccup.
+        print("Channel membership check failed:", error)
+        return True
+
+
+def channel_join_markup():
+    markup = InlineKeyboardMarkup()
+    markup.add(InlineKeyboardButton("📢 Join the Channel", url=f"https://t.me/{CHANNEL_USERNAME.lstrip('@')}"))
+    return markup
+
+
+def enforce_channel_join(message, user):
+    """Returns True if the user may proceed, False if they were just blocked
+    and shown a 'please join the channel' prompt."""
+    if user["total_messages"] < CHANNEL_JOIN_THRESHOLD or user["channel_verified"]:
+        return True
+
+    if has_joined_channel(user["user_id"]):
+        conn = get_db()
+        conn.execute("UPDATE users SET channel_verified=1 WHERE user_id=?", (user["user_id"],))
+        conn.commit()
+        conn.close()
+        return True
+
+    bot.reply_to(
+        message,
+        "🔔 Please join our news channel first, then you can continue using the bot.",
+        reply_markup=channel_join_markup()
+    )
+    return False
 
 
 def save_message(user_id, role, content):
@@ -143,6 +209,14 @@ def system_prompt(notes="", doc_context=""):
         "(e.g. technical software terms can stay in English). Read your own Amharic "
         "sentence back mentally before answering and make sure it sounds like something "
         "a real person would say, not a direct translation from English.\n\n"
+
+        "AMHARIC PRONOUN RULE (strict, never break this): when addressing the user in "
+        "Amharic, ALWAYS use the polite, gender-neutral second-person form (እርስዎ / "
+        "ይችላሉ / ያደርጋሉ / ይፈልጋሉ style verb conjugation). NEVER use the gendered informal "
+        "forms አንተ (masculine) or አንቺ (feminine) — you do not reliably know the user's "
+        "gender, and switching between them mid-conversation is a serious error. Stay "
+        "consistent with the polite form in every single Amharic reply, even in casual "
+        "conversation, even if the user themselves writes informally.\n\n"
 
         "If the user writes in another language, respond naturally and fluently in "
         "that same language using the same care described above.\n\n"
@@ -328,18 +402,22 @@ def send_long_message(message, text, feedback_markup=None):
 def send_welcome(message, extra_note=""):
     name = message.from_user.first_name or "there"
     text = (
-        f"Hello {name}! Welcome to BOSSAI — your all-in-one AI assistant.\n\n"
-        "Access GPT-4o, Claude, DeepSeek, Grok, and Gemini in one bot.\n\n"
-        "I can:\n"
-        "- Answer questions\n"
-        "- Write and translate text\n"
-        "- Write and debug code\n"
-        "- Solve math problems\n"
-        "- Remember conversations\n"
-        "- Create real images and music\n\n"
-        f"Free: {FREE_LIMIT} messages per day\n"
-        f"Unlimited: {MONTHLY_PRICE} ETB/month\n\n"
-        "Use the buttons below."
+        f"👋 Welcome {name} to BOSSAI!\n\n"
+        "🤖 Your all-in-one AI assistant — GPT-4o, Claude, DeepSeek, Grok, and Gemini "
+        "in a single bot.\n\n"
+        "What I can do:\n"
+        "💬 Answer any question\n"
+        "🌍 Translate and write text\n"
+        "💻 Write and debug code\n"
+        "🖼️ See and explain photos you send (Vision)\n"
+        "📎 Read files/documents and answer questions about them\n"
+        "🎨 Create real images\n"
+        "🎵 Create real music\n"
+        "📄 Create Word documents (subscribers)\n\n"
+        f"🆓 Free: {FREE_LIMIT} messages per day\n"
+        f"⭐ Unlimited: {MONTHLY_PRICE} ETB/month\n\n"
+        f"📢 Join {CHANNEL_USERNAME} for updates and new features.\n\n"
+        "Use the buttons below, or just ask me anything directly."
     )
     bot.send_message(message.chat.id, text + extra_note, reply_markup=main_keyboard(message.from_user.id))
 
@@ -353,6 +431,7 @@ def start(message):
     conn.close()
 
     user = get_user(user_id, message.from_user.first_name, message.from_user.username)
+    user_mode.pop(user_id, None)
 
     referral_note = ""
 
@@ -371,7 +450,7 @@ def start(message):
                         )
                         conn.execute("UPDATE users SET referrals=referrals+1 WHERE user_id=?", (referrer_id,))
                         conn.commit()
-                        referral_note = "\n\nYou joined through a referral link. Welcome!"
+                        referral_note = "\n\n🎉 You joined through a referral link. Welcome!"
                     conn.close()
             except (ValueError, IndexError):
                 pass
@@ -390,7 +469,8 @@ def start(message):
             "📊 My Account — check your plan and usage\n"
             "🎨 Create Image — generate a real image\n"
             "🎵 Create Music — generate a real short music clip\n"
-            "📄 Create Document — generate a Word file (unlimited subscribers)\n"
+            "🎬 Create Video — coming soon\n"
+            "📄 Create Document — generate a Word file (subscribers)\n"
             "🧠 My Memory — tell me things to remember about you\n\n"
             "You can also just type any question directly, right now."
         )
@@ -475,6 +555,10 @@ def photo_handler(message):
     if user_id in telebirr_waiting:
         telebirr_waiting.discard(user_id)
         handle_payment_receipt(message)
+        return
+
+    user = get_user(user_id, message.from_user.first_name, message.from_user.username)
+    if not enforce_channel_join(message, user):
         return
 
     handle_vision_photo(message)
@@ -774,6 +858,7 @@ def restart(message):
     conn.commit()
     conn.close()
     active_documents.pop(message.from_user.id, None)
+    user_mode.pop(message.from_user.id, None)
     send_welcome(message, "\n\n🔄 Your conversation memory has been cleared.")
 
 
@@ -807,6 +892,9 @@ def extract_docx_text(docx_bytes):
 def document_upload_handler(message):
     user_id = message.from_user.id
     user = get_user(user_id, message.from_user.first_name, message.from_user.username)
+
+    if not enforce_channel_join(message, user):
+        return
 
     if not subscription_active(user):
         if user["free_used"] >= FREE_LIMIT:
@@ -868,6 +956,28 @@ def document_upload_handler(message):
 IMAGE_MODEL = "google/gemini-2.5-flash-image"
 
 
+def translate_prompt_to_english(prompt):
+    """Image models respond far better to English prompts. Translate silently
+    if the prompt looks non-English; on any failure just use the original text."""
+    if not GEMINI_API_KEY:
+        return prompt
+    try:
+        client = genai.Client(api_key=GEMINI_API_KEY)
+        instruction = (
+            "Translate the following image-generation description into natural, "
+            "vivid English suitable for an AI image generator. If it is already "
+            "in English, just return it unchanged, possibly lightly cleaned up. "
+            "Reply with ONLY the translated/cleaned description, nothing else, "
+            "no quotation marks, no preamble:\n\n" + prompt
+        )
+        response = call_gemini_with_retry(client, model="gemini-3.6-flash", contents=instruction)
+        translated = (response.text or "").strip()
+        return translated if translated else prompt
+    except Exception as error:
+        print("Prompt translation failed, using original prompt:", error)
+        return prompt
+
+
 def generate_image(prompt):
     # Primary: Pollinations.ai — free, keyless image generation (no billing needed).
     try:
@@ -911,24 +1021,28 @@ def generate_image(prompt):
     return base64.b64decode(b64)
 
 
-image_waiting = set()
+user_mode = {}  # user_id -> "image" | "music" | "video" | None. Persists until the
+                 # user taps "🔙 Back to Chat" — lets them refine ("no, make it...")
+                 # without re-tapping the menu button each time.
 
 
 @bot.message_handler(func=lambda m: m.text == "🎨 Create Image")
 def image_button(message):
-    image_waiting.add(message.from_user.id)
+    get_user(message.from_user.id, message.from_user.first_name, message.from_user.username)
+    user_mode[message.from_user.id] = "image"
     bot.send_message(
         message.chat.id,
-        "Create Image\n\n"
-        "Send me a description of the image you want.\n\n"
-        "Example:\nA futuristic city at night, cinematic lighting, realistic, highly detailed."
+        "🎨 Create Image\n\n"
+        "Send me a description of the image you want. You can keep sending changes "
+        "afterward (e.g. \"no, make the sky blue\") and I'll regenerate it.\n\n"
+        "Example:\nA futuristic city at night, cinematic lighting, realistic, highly detailed.\n\n"
+        "Tap 🔙 Back to Chat to return to normal chat.",
+        reply_markup=mode_keyboard()
     )
 
 
 def process_image_prompt(message):
     user_id = message.from_user.id
-    image_waiting.discard(user_id)
-
     prompt = message.text.strip()
 
     if not prompt:
@@ -957,7 +1071,8 @@ def process_image_prompt(message):
 
     try:
         bot.send_message(message.chat.id, "Creating your image, please wait...")
-        image_bytes = generate_image(prompt)
+        english_prompt = translate_prompt_to_english(prompt)
+        image_bytes = generate_image(english_prompt)
         bot.send_photo(message.chat.id, image_bytes, caption="Generated by BOSSAI")
     except Exception as error:
         print("IMAGE ERROR:", error)
@@ -1023,24 +1138,36 @@ def generate_music(prompt):
     return base64.b64decode(full_audio_b64)
 
 
-music_waiting = set()
-
-
 @bot.message_handler(func=lambda m: m.text == "🎵 Create Music")
 def music_button(message):
-    music_waiting.add(message.from_user.id)
+    get_user(message.from_user.id, message.from_user.first_name, message.from_user.username)
+    user_mode[message.from_user.id] = "music"
     bot.send_message(
         message.chat.id,
-        "Create Music\n\n"
-        "Describe the song or music you want (genre, mood, instruments).\n\n"
-        "Example:\nUpbeat Ethiopian-inspired pop song about friendship, happy mood."
+        "🎵 Create Music\n\n"
+        "Describe the song or music you want (genre, mood, instruments). You can keep "
+        "sending changes afterward and I'll regenerate it.\n\n"
+        "Example:\nUpbeat Ethiopian-inspired pop song about friendship, happy mood.\n\n"
+        "Tap 🔙 Back to Chat to return to normal chat.",
+        reply_markup=mode_keyboard()
+    )
+
+
+@bot.message_handler(func=lambda m: m.text == "🎬 Create Video")
+def video_button(message):
+    get_user(message.from_user.id, message.from_user.first_name, message.from_user.username)
+    user_mode[message.from_user.id] = "video"
+    bot.send_message(
+        message.chat.id,
+        "🎬 Create Video\n\n"
+        "🚧 This feature is coming soon! It's not ready yet.\n\n"
+        "Tap 🔙 Back to Chat to return to normal chat.",
+        reply_markup=mode_keyboard()
     )
 
 
 def process_music_prompt(message):
     user_id = message.from_user.id
-    music_waiting.discard(user_id)
-
     prompt = message.text.strip()
 
     if not prompt:
@@ -1342,6 +1469,48 @@ def admin_panel_button(message):
     bot.send_message(message.chat.id, build_admin_stats(), reply_markup=admin_panel_markup())
 
 
+broadcast_waiting = set()
+
+
+@bot.message_handler(func=lambda m: m.text == "📢 Broadcast")
+def broadcast_button(message):
+    if not is_admin(message.from_user.id):
+        return
+    broadcast_waiting.add(message.from_user.id)
+    bot.send_message(
+        message.chat.id,
+        "📢 Broadcast\n\nSend the message now, it will be delivered to all users.\n\n"
+        "To cancel, send 'cancel'."
+    )
+
+
+def process_broadcast(message):
+    user_id = message.from_user.id
+    broadcast_waiting.discard(user_id)
+
+    text = (message.text or "").strip()
+    if not text or text.lower() == "cancel":
+        bot.reply_to(message, "Broadcast cancelled.")
+        return
+
+    conn = get_db()
+    user_ids = [row["user_id"] for row in conn.execute("SELECT user_id FROM users").fetchall()]
+    conn.close()
+
+    bot.reply_to(message, f"📢 Sending to {len(user_ids)} users, please wait...")
+
+    sent, failed = 0, 0
+    for target_id in user_ids:
+        try:
+            bot.send_message(target_id, text)
+            sent += 1
+        except Exception:
+            failed += 1
+        time.sleep(0.05)  # avoid tripping Telegram's flood limits on large user bases
+
+    bot.send_message(message.chat.id, f"📢 Broadcast done.\nSent: {sent}\nFailed (blocked/deleted): {failed}")
+
+
 @bot.callback_query_handler(func=lambda call: call.data.startswith("adm:"))
 def admin_panel_callback(call):
     if not is_admin(call.from_user.id):
@@ -1380,12 +1549,44 @@ def chat(message):
 
     user_id = message.from_user.id
 
-    if user_id in image_waiting:
-        process_image_prompt(message)
+    # Exit any active mode first, regardless of anything else.
+    if text == "🔙 Back to Chat":
+        user_mode.pop(user_id, None)
+        bot.send_message(message.chat.id, "🔙 Back to normal chat.", reply_markup=main_keyboard(user_id))
         return
 
-    if user_id in music_waiting:
+    # Universal spam protection — applies to every text message, including
+    # image/music mode messages (previously these could bypass the cooldown).
+    now = time.time()
+    previous = last_request.get(user_id, 0)
+    if now - previous < 2:
+        bot.reply_to(message, "Wait a moment before your next message.")
+        return
+    last_request[user_id] = now
+
+    user = get_user(user_id, message.from_user.first_name, message.from_user.username)
+
+    if is_admin(user_id) and user_id in broadcast_waiting:
+        process_broadcast(message)
+        return
+
+    if not enforce_channel_join(message, user):
+        return
+
+    conn = get_db()
+    conn.execute("UPDATE users SET total_messages=total_messages+1 WHERE user_id=?", (user_id,))
+    conn.commit()
+    conn.close()
+
+    mode = user_mode.get(user_id)
+    if mode == "image":
+        process_image_prompt(message)
+        return
+    if mode == "music":
         process_music_prompt(message)
+        return
+    if mode == "video":
+        bot.reply_to(message, "🚧 This feature is coming soon! It's not ready yet.")
         return
 
     if user_id in doc_waiting:
@@ -1395,15 +1596,6 @@ def chat(message):
     if user_id in memory_waiting:
         process_memory_input(message)
         return
-
-    now = time.time()
-    previous = last_request.get(user_id, 0)
-    if now - previous < 2:
-        bot.reply_to(message, "Wait a moment before your next message.")
-        return
-    last_request[user_id] = now
-
-    user = get_user(user_id, message.from_user.first_name, message.from_user.username)
 
     if not subscription_active(user):
         if user["free_used"] >= FREE_LIMIT:
@@ -1511,6 +1703,63 @@ def notify_admin(text):
         print("Could not notify admin:", e)
 
 
+REENGAGEMENT_IDLE_SECONDS = 6 * 60 * 60  # 6 hours
+REENGAGEMENT_CHECK_INTERVAL = 30 * 60    # check every 30 minutes
+
+
+def reengagement_loop():
+    """Background daemon: DM any user who has interacted before but has gone
+    quiet for 6+ hours, calling them by name. Sent once per idle stretch —
+    get_user() clears reminder_sent_at the moment they're active again."""
+    while True:
+        try:
+            now = int(time.time())
+            cutoff = now - REENGAGEMENT_IDLE_SECONDS
+            conn = get_db()
+            rows = conn.execute(
+                """
+                SELECT user_id, first_name FROM users
+                WHERE last_active IS NOT NULL
+                  AND last_active <= ?
+                  AND reminder_sent_at IS NULL
+                """,
+                (cutoff,)
+            ).fetchall()
+            conn.close()
+
+            for row in rows:
+                name = row["first_name"] or ""
+                try:
+                    bot.send_message(
+                        row["user_id"],
+                        f"Hey {name}, everything okay? Come use the bot! Share whatever's on your mind." if name else
+"Hey, everything okay? Come use the bot! Share whatever's on your mind."
+                    )
+                    conn = get_db()
+                    conn.execute(
+                        "UPDATE users SET reminder_sent_at=? WHERE user_id=?",
+                        (now, row["user_id"])
+                    )
+                    conn.commit()
+                    conn.close()
+                except Exception as error:
+                    # User blocked the bot, deleted their account, etc. — mark it
+                    # sent anyway so we don't retry forever on a dead chat.
+                    print("Reengagement send failed for", row["user_id"], ":", error)
+                    conn = get_db()
+                    conn.execute(
+                        "UPDATE users SET reminder_sent_at=? WHERE user_id=?",
+                        (now, row["user_id"])
+                    )
+                    conn.commit()
+                    conn.close()
+        except Exception as error:
+            print("Reengagement loop error:", error)
+            traceback.print_exc()
+
+        time.sleep(REENGAGEMENT_CHECK_INTERVAL)
+
+
 def main():
     try:
         init_database()
@@ -1526,6 +1775,9 @@ def main():
         print("Could not remove webhook:", error)
 
     startup_diagnostic()
+
+    reengagement_thread = threading.Thread(target=reengagement_loop, daemon=True)
+    reengagement_thread.start()
 
     while True:
         try:
