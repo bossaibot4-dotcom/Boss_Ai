@@ -225,6 +225,18 @@ def ask_openrouter(user_id, text):
     return data["choices"][0]["message"]["content"]
 
 
+def call_gemini_with_retry(client, **kwargs):
+    """Gemini occasionally returns a transient 503 'high demand' error.
+    Retry once after a short pause before giving up."""
+    try:
+        return client.models.generate_content(**kwargs)
+    except Exception as error:
+        if "503" in str(error) or "UNAVAILABLE" in str(error):
+            time.sleep(3)
+            return client.models.generate_content(**kwargs)
+        raise
+
+
 def ask_gemini(user_id, text):
     if not GEMINI_API_KEY:
         raise RuntimeError("GEMINI_API_KEY is missing.")
@@ -239,7 +251,7 @@ def ask_gemini(user_id, text):
     prompt = system_prompt(user["notes"] or "", doc_context) + "\n\nPrevious conversation:\n" + conversation + "\n\nCurrent user message:\n" + text
 
     client = genai.Client(api_key=GEMINI_API_KEY)
-    response = client.models.generate_content(model="gemini-3.6-flash", contents=prompt)
+    response = call_gemini_with_retry(client, model="gemini-3.6-flash", contents=prompt)
 
     if not response.text:
         raise RuntimeError("Gemini returned an empty response.")
@@ -536,7 +548,8 @@ def handle_vision_photo(message):
 
         client = genai.Client(api_key=GEMINI_API_KEY)
         image_part = types.Part.from_bytes(data=file_bytes, mime_type="image/jpeg")
-        response = client.models.generate_content(
+        response = call_gemini_with_retry(
+            client,
             model="gemini-3.6-flash",
             contents=[system_prompt(user["notes"] or "") + "\n\n" + question, image_part]
         )
@@ -774,7 +787,8 @@ def extract_pdf_text(pdf_bytes):
         raise RuntimeError("GEMINI_API_KEY is missing.")
     client = genai.Client(api_key=GEMINI_API_KEY)
     pdf_part = types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf")
-    response = client.models.generate_content(
+    response = call_gemini_with_retry(
+        client,
         model="gemini-3.6-flash",
         contents=["Extract and return the full readable text content of this document, preserving its structure (headings, sections, lists). Do not summarize, do not add commentary — just the extracted text.", pdf_part]
     )
