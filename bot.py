@@ -10,6 +10,7 @@ import requests
 import telebot
 
 from google import genai
+from google.genai import types
 from docx import Document as DocxDocument
 
 from telebot.types import (
@@ -127,7 +128,7 @@ def get_history(user_id):
     return [{"role": row["role"], "content": row["content"]} for row in rows]
 
 
-def system_prompt(notes=""):
+def system_prompt(notes="", doc_context=""):
     base = (
         "You are BOSSAI, a natural all-in-one AI assistant. "
         "Default language is English unless the user writes in another language.\n\n"
@@ -170,6 +171,14 @@ def system_prompt(notes=""):
             "do not just recite it back):\n" + notes
         )
 
+    if doc_context:
+        base += (
+            "\n\nThe user has shared a document with you. Use its content to answer their "
+            "questions, explain concepts from it, or highlight interesting points, as asked. "
+            "Do not mention that this was 'provided as context' — just discuss it naturally "
+            "as if you read the file.\n\nDocument content:\n" + doc_context
+        )
+
     return base
 
 
@@ -180,6 +189,11 @@ CHAT_MODELS = {
     "Grok": "x-ai/grok-2-1212",
 }
 
+# In-memory store of the most recently uploaded document's extracted text, per user.
+# Not persisted to disk on purpose — it's a temporary "let's discuss this file" session.
+active_documents = {}
+MAX_DOC_CONTEXT_CHARS = 8000
+
 
 def ask_openrouter(user_id, text):
     if not OPENROUTER_API_KEY:
@@ -188,8 +202,9 @@ def ask_openrouter(user_id, text):
     user = get_user(user_id)
     model = user["model"]
     history = get_history(user_id)
+    doc_context = active_documents.get(user_id, "")
 
-    messages = [{"role": "system", "content": system_prompt(user["notes"] or "")}]
+    messages = [{"role": "system", "content": system_prompt(user["notes"] or "", doc_context)}]
     messages.extend(history)
     messages.append({"role": "user", "content": text})
 
@@ -199,7 +214,7 @@ def ask_openrouter(user_id, text):
             "Authorization": f"Bearer {OPENROUTER_API_KEY}",
             "Content-Type": "application/json",
         },
-        json={"model": CHAT_MODELS.get(model, CHAT_MODELS["GPT-4o"]), "messages": messages},
+        json={"model": CHAT_MODELS.get(model, CHAT_MODELS["GPT-4o"]), "messages": messages, "max_tokens": 1200},
         timeout=90
     )
 
@@ -216,11 +231,12 @@ def ask_gemini(user_id, text):
 
     user = get_user(user_id)
     history = get_history(user_id)
+    doc_context = active_documents.get(user_id, "")
     conversation = ""
     for item in history:
         conversation += item["role"] + ": " + item["content"] + "\n"
 
-    prompt = system_prompt(user["notes"] or "") + "\n\nPrevious conversation:\n" + conversation + "\n\nCurrent user message:\n" + text
+    prompt = system_prompt(user["notes"] or "", doc_context) + "\n\nPrevious conversation:\n" + conversation + "\n\nCurrent user message:\n" + text
 
     client = genai.Client(api_key=GEMINI_API_KEY)
     response = client.models.generate_content(model="gemini-3.6-flash", contents=prompt)
@@ -504,7 +520,7 @@ def handle_vision_photo(message):
         conn.commit()
         conn.close()
 
-    if not OPENROUTER_API_KEY:
+    if not GEMINI_API_KEY:
         bot.reply_to(message, "Photo understanding is not available right now.")
         return
 
@@ -517,35 +533,18 @@ def handle_vision_photo(message):
     try:
         file_info = bot.get_file(message.photo[-1].file_id)
         file_bytes = bot.download_file(file_info.file_path)
-        image_b64 = base64.b64encode(file_bytes).decode("utf-8")
 
-        response = requests.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": CHAT_MODELS["GPT-4o"],
-                "messages": [
-                    {"role": "system", "content": system_prompt(user["notes"] or "")},
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": question},
-                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}},
-                        ],
-                    },
-                ],
-            },
-            timeout=90
+        client = genai.Client(api_key=GEMINI_API_KEY)
+        image_part = types.Part.from_bytes(data=file_bytes, mime_type="image/jpeg")
+        response = client.models.generate_content(
+            model="gemini-3.6-flash",
+            contents=[system_prompt(user["notes"] or "") + "\n\n" + question, image_part]
         )
 
-        if not response.ok:
-            raise RuntimeError(f"Vision API {response.status_code}: {response.text[:300]}")
+        if not response.text:
+            raise RuntimeError("Gemini returned an empty response for the image.")
 
-        answer = response.json()["choices"][0]["message"]["content"]
-        send_long_message(message, answer)
+        send_long_message(message, response.text)
     except Exception as error:
         print("VISION ERROR:", error)
         traceback.print_exc()
@@ -761,20 +760,115 @@ def restart(message):
     conn.execute("DELETE FROM messages WHERE user_id=?", (message.from_user.id,))
     conn.commit()
     conn.close()
+    active_documents.pop(message.from_user.id, None)
     send_welcome(message, "\n\n🔄 Your conversation memory has been cleared.")
 
 
-@bot.message_handler(content_types=["document", "voice", "audio"])
-def file_handler(message):
-    bot.reply_to(message, "I received your file.\n\nFile and voice analysis can be connected to the appropriate processing service.")
+@bot.message_handler(content_types=["voice", "audio"])
+def voice_handler(message):
+    bot.reply_to(message, "I received your voice message.\n\nVoice transcription is not available yet.")
+
+
+def extract_pdf_text(pdf_bytes):
+    if not GEMINI_API_KEY:
+        raise RuntimeError("GEMINI_API_KEY is missing.")
+    client = genai.Client(api_key=GEMINI_API_KEY)
+    pdf_part = types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf")
+    response = client.models.generate_content(
+        model="gemini-3.6-flash",
+        contents=["Extract and return the full readable text content of this document, preserving its structure (headings, sections, lists). Do not summarize, do not add commentary — just the extracted text.", pdf_part]
+    )
+    if not response.text:
+        raise RuntimeError("Could not read this PDF.")
+    return response.text
+
+
+def extract_docx_text(docx_bytes):
+    document = DocxDocument(io.BytesIO(docx_bytes))
+    parts = [p.text for p in document.paragraphs if p.text.strip()]
+    return "\n".join(parts)
+
+
+@bot.message_handler(content_types=["document"])
+def document_upload_handler(message):
+    user_id = message.from_user.id
+    user = get_user(user_id, message.from_user.first_name, message.from_user.username)
+
+    if not subscription_active(user):
+        if user["free_used"] >= FREE_LIMIT:
+            bot.reply_to(
+                message,
+                f"You have used all {FREE_LIMIT} free messages for today.\n\n"
+                f"Unlimited access is {MONTHLY_PRICE} ETB/month.\n\n"
+                "Open Payment Methods to continue."
+            )
+            return
+        conn = get_db()
+        conn.execute("UPDATE users SET free_used=free_used+1 WHERE user_id=?", (user_id,))
+        conn.commit()
+        conn.close()
+
+    file_name = (message.document.file_name or "").lower()
+
+    if not (file_name.endswith(".pdf") or file_name.endswith(".docx") or file_name.endswith(".txt")):
+        bot.reply_to(message, "Please send a PDF, Word (.docx), or plain text (.txt) file.")
+        return
+
+    stop_event = threading.Event()
+    typing_thread = threading.Thread(target=typing_loop, args=(message.chat.id, stop_event), daemon=True)
+    typing_thread.start()
+
+    try:
+        bot.reply_to(message, "📎 Reading your file, please wait...")
+        file_info = bot.get_file(message.document.file_id)
+        file_bytes = bot.download_file(file_info.file_path)
+
+        if file_name.endswith(".pdf"):
+            extracted_text = extract_pdf_text(file_bytes)
+        elif file_name.endswith(".docx"):
+            extracted_text = extract_docx_text(file_bytes)
+        else:
+            extracted_text = file_bytes.decode("utf-8", errors="ignore")
+
+        if not extracted_text.strip():
+            bot.reply_to(message, "I couldn't find any readable text in this file.")
+            return
+
+        active_documents[user_id] = extracted_text[:MAX_DOC_CONTEXT_CHARS]
+
+        bot.reply_to(
+            message,
+            "✅ Got it, I've read the file.\n\n"
+            "Ask me anything about it — explain a part, summarize it, quiz you on it, "
+            "whatever you need. I'll keep it in mind until you send a new file or tap Restart."
+        )
+    except Exception as error:
+        print("DOCUMENT READ ERROR:", error)
+        traceback.print_exc()
+        notify_admin_error("Document Read", user_id, error)
+        bot.reply_to(message, f"Debug info (temporary): {str(error)[:500]}")
+    finally:
+        stop_event.set()
 
 
 IMAGE_MODEL = "google/gemini-2.5-flash-image"
 
 
 def generate_image(prompt):
+    # Primary: Pollinations.ai — free, keyless image generation (no billing needed).
+    try:
+        encoded_prompt = requests.utils.quote(prompt)
+        url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=1024&height=1024&nologo=true&model=flux"
+        response = requests.get(url, timeout=90)
+        if response.ok and response.content and len(response.content) > 500:
+            return response.content
+        print("Pollinations image generation returned an unusable response, falling back.")
+    except Exception as error:
+        print("Pollinations image generation failed:", error)
+
+    # Fallback: OpenRouter (requires account credit).
     if not OPENROUTER_API_KEY:
-        raise RuntimeError("OPENROUTER_API_KEY is missing.")
+        raise RuntimeError("Free image generation failed and OPENROUTER_API_KEY is missing.")
 
     response = requests.post(
         "https://openrouter.ai/api/v1/images",
@@ -997,6 +1091,7 @@ def ask_document_content(topic):
                 },
                 json={
                     "model": CHAT_MODELS["DeepSeek"],
+                    "max_tokens": 1800,
                     "messages": [
                         {"role": "system", "content": document_system_prompt},
                         {"role": "user", "content": topic},
