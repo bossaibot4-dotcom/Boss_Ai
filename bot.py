@@ -79,7 +79,7 @@ def init_database():
             username TEXT,
             free_used INTEGER DEFAULT 0,
             free_date TEXT,
-            model TEXT DEFAULT 'GPT-4o',
+            model TEXT DEFAULT 'Gemini',
             subscription_until INTEGER DEFAULT 0,
             referred_by INTEGER DEFAULT NULL,
             referrals INTEGER DEFAULT 0,
