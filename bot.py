@@ -305,7 +305,7 @@ def enforce_channel_join(message, user):
 
     bot.reply_to(
         message,
-        "🔔To continue using it, please join our news channel first.",
+        "🔔 To continue using the bot, please join our news channel first.",
         reply_markup=channel_join_markup()
     )
     return False
@@ -436,12 +436,8 @@ def call_gemini_with_retry(client, **kwargs):
     try:
         return client.models.generate_content(**kwargs)
     except Exception as error:
-        error_text = str(error)
-        if "503" in error_text or "UNAVAILABLE" in error_text:
+        if "503" in str(error) or "UNAVAILABLE" in str(error):
             time.sleep(3)
-            return client.models.generate_content(**kwargs)
-        if "429" in error_text or "RESOURCE_EXHAUSTED" in error_text:
-            time.sleep(15)
             return client.models.generate_content(**kwargs)
         raise
 
@@ -2790,16 +2786,10 @@ def chat(message):
             error
         )
 
-        if "429" in str(error) or "RESOURCE_EXHAUSTED" in str(error):
-            bot.reply_to(
-                message,
-                "⏳ Lots of requests right now — please try again in a minute."
-            )
-        else:
-            bot.reply_to(
-                message,
-                f"Debug info (temporary): {str(error)[:500]}"
-            )
+        bot.reply_to(
+            message,
+            f"Debug info (temporary): {str(error)[:500]}"
+        )
 
     finally:
         stop_event.set()
@@ -2926,14 +2916,14 @@ def reengagement_loop():
                 name = row["first_name"] or ""
 
                 reminder = (
-                    f"Hey {name}, everything okay? "
-                    "Come use BOSSAI! Share "
-                    "whatever's on your mind."
+                    f"{name}, what’s wrong? Is everything okay? "
+"Use BOSSAI! If you have anything "
+"to share with me, please share it."
                     if name
                     else
-                    "Hey, everything okay? "
-                    "Come use BOSSAI! Share "
-                    "whatever's on your mind."
+                    "What's up? Is everything okay? "
+"Use BOSSAI! If you have anything "
+"to share, please share it with me."
                 )
 
                 try:
