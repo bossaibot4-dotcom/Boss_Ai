@@ -79,7 +79,7 @@ def init_database():
             username TEXT,
             free_used INTEGER DEFAULT 0,
             free_date TEXT,
-            model TEXT DEFAULT 'Gemini',
+            model TEXT DEFAULT 'GPT-4o',
             subscription_until INTEGER DEFAULT 0,
             referred_by INTEGER DEFAULT NULL,
             referrals INTEGER DEFAULT 0,
@@ -517,28 +517,65 @@ def ask_gemini(user_id, text):
     return response.text
 
 
+def ask_openrouter_model(user_id, text, model_name):
+    if not OPENROUTER_API_KEY:
+        raise RuntimeError("OPENROUTER_API_KEY is missing.")
+
+    history = get_history(user_id)
+    messages = [{"role": "system", "content": system_prompt()}]
+    messages.extend(history)
+    messages.append({"role": "user", "content": text})
+
+    response = requests.post(
+        "https://openrouter.ai/api/v1/chat/completions",
+        headers={
+            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+            "Content-Type": "application/json"
+        },
+        json={
+            "model": CHAT_MODELS[model_name],
+            "messages": messages,
+            "max_tokens": 1200
+        },
+        timeout=90
+    )
+
+    if not response.ok:
+        raise RuntimeError(
+            f"OpenRouter {model_name} {response.status_code}: {response.text[:300]}"
+        )
+
+    data = response.json()
+    content = data["choices"][0]["message"].get("content", "")
+    if not content:
+        raise RuntimeError(f"{model_name} returned an empty response.")
+    return content
+
+
 def ask_ai(user_id, text):
-    user = get_user(user_id)
+    # Gemini is always the primary model. We intentionally do not save a
+    # fallback choice, so the next request tries Gemini again automatically.
+    # If Gemini is unavailable/quota-limited, continue silently through the chain.
+    fallback_chain = ["Gemini", "Claude", "Grok", "DeepSeek", "GPT-4o"]
+    errors = []
 
-    if user["model"] == "Gemini":
-        return ask_gemini(user_id, text)
-
-    try:
-        return ask_openrouter(user_id, text)
-    except Exception as openrouter_error:
-        print("OpenRouter failed:", openrouter_error)
-
-        if GEMINI_API_KEY:
-            try:
+    for model_name in fallback_chain:
+        try:
+            if model_name == "Gemini":
+                if not GEMINI_API_KEY:
+                    raise RuntimeError("GEMINI_API_KEY is missing.")
                 return ask_gemini(user_id, text)
-            except Exception as gemini_error:
-                print("Gemini fallback also failed:", gemini_error)
-                raise RuntimeError(
-                    f"OpenRouter error: {openrouter_error} | "
-                    f"Gemini error: {gemini_error}"
-                )
 
-        raise
+            return ask_openrouter_model(user_id, text, model_name)
+
+        except Exception as error:
+            errors.append(f"{model_name}: {str(error)[:350]}")
+            print(f"{model_name} failed; trying next model:", error)
+            continue
+
+    # Never expose provider/API errors to users. The admin notification layer
+    # receives the real exception from the caller.
+    raise RuntimeError("All AI providers are temporarily unavailable.")
 
 
 def notify_admin_error(context, user_id, error):
@@ -1000,7 +1037,7 @@ def handle_vision_photo(message):
         notify_admin_error("Vision", user_id, error)
         bot.reply_to(
             message,
-            f"Debug info (temporary): {str(error)[:500]}"
+            "Sorry, the service is temporarily unavailable. Please try again shortly."
         )
 
     finally:
@@ -1577,7 +1614,7 @@ def document_upload_handler(message):
 
         bot.reply_to(
             message,
-            f"Debug info (temporary): {str(error)[:500]}"
+            "Sorry, the service is temporarily unavailable. Please try again shortly."
         )
 
     finally:
@@ -1811,7 +1848,7 @@ def process_image_prompt(message):
 
         bot.send_message(
             message.chat.id,
-            f"Debug info (temporary): {str(error)[:500]}"
+            "Sorry, the service is temporarily unavailable. Please try again shortly."
         )
 
     finally:
@@ -2012,7 +2049,7 @@ def process_music_prompt(message):
 
         bot.send_message(
             message.chat.id,
-            f"Debug info (temporary): {str(error)[:500]}"
+            "Sorry, the service is temporarily unavailable. Please try again shortly."
         )
 
     finally:
@@ -2210,7 +2247,7 @@ def process_document_prompt(message):
 
         bot.send_message(
             message.chat.id,
-            f"Debug info (temporary): {str(error)[:500]}"
+            "Sorry, the service is temporarily unavailable. Please try again shortly."
         )
 
     finally:
@@ -2788,7 +2825,7 @@ def chat(message):
 
         bot.reply_to(
             message,
-            f"Debug info (temporary): {str(error)[:500]}"
+            "Sorry, the service is temporarily unavailable. Please try again shortly."
         )
 
     finally:
