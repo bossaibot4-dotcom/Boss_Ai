@@ -79,7 +79,7 @@ def init_database():
             username TEXT,
             free_used INTEGER DEFAULT 0,
             free_date TEXT,
-            model TEXT DEFAULT 'Deepseek',
+            model TEXT DEFAULT 'GPT-4o',
             subscription_until INTEGER DEFAULT 0,
             referred_by INTEGER DEFAULT NULL,
             referrals INTEGER DEFAULT 0,
@@ -305,7 +305,7 @@ def enforce_channel_join(message, user):
 
     bot.reply_to(
         message,
-        "🔔 To continue using the bot, please join our news channel first.",
+        "🔔To continue using it, please first join our news channel.",
         reply_markup=channel_join_markup()
     )
     return False
@@ -412,6 +412,8 @@ use 🎬 Create Video. Never claim a file was generated unless the system actual
 generated and sent that file.
 """
 
+    base += "\n\n" + current_time_context()
+
     if notes:
         base += (
             "\n\nUSER MEMORY:\n"
@@ -432,13 +434,43 @@ generated and sent that file.
     return base
 
 
+def current_time_context():
+    from zoneinfo import ZoneInfo
+    from datetime import datetime
+
+    now = datetime.now(ZoneInfo("Africa/Addis_Ababa"))
+    formatted = now.strftime("%A, %B %d, %Y, %H:%M")
+
+    return (
+        "CURRENT DATE AND TIME:\n"
+        f"Right now it is {formatted} (Ethiopia time, East Africa Time, UTC+3). "
+        "Use this as the true current date/time for anything time-related "
+        "(what year/day it is, calculating ages, deadlines, holidays, "
+        "\"today\", \"this week\", etc.). Do not say you don't know the "
+        "current date."
+    )
+
+
 def call_gemini_with_retry(client, **kwargs):
+    if "config" not in kwargs:
+        kwargs["config"] = types.GenerateContentConfig(
+            max_output_tokens=8192,
+            thinking_config=types.ThinkingConfig(thinking_level="LOW")
+        )
+
     try:
         return client.models.generate_content(**kwargs)
     except Exception as error:
-        if "503" in str(error) or "UNAVAILABLE" in str(error):
+        error_text = str(error)
+
+        if "503" in error_text or "UNAVAILABLE" in error_text:
             time.sleep(3)
             return client.models.generate_content(**kwargs)
+
+        if "429" in error_text or "RESOURCE_EXHAUSTED" in error_text:
+            time.sleep(15)
+            return client.models.generate_content(**kwargs)
+
         raise
 
 
@@ -1623,46 +1655,22 @@ def document_upload_handler(message):
 
 def translate_prompt_to_english(prompt):
     """
-    Convert an Amharic/non-English image prompt into vivid, precise English.
-    The original prompt is preserved if translation fails.
+    Convert an Amharic/non-English image prompt into English using a
+    dedicated, keyless translation service (deep-translator / Google
+    Translate). This is intentionally independent of the Gemini API so
+    image generation keeps working even if chat's Gemini quota is busy,
+    and so the translation is a faithful, literal conversion rather than
+    a creative LLM rewrite that can drift from what the user asked for.
     """
-    if not GEMINI_API_KEY:
-        return prompt
-
     try:
-        client = genai.Client(
-            api_key=GEMINI_API_KEY
-        )
+        from deep_translator import GoogleTranslator
 
-        instruction = (
-            "You are an expert image-prompt translator and editor.\n\n"
-            "Translate the user's image-generation request into natural, "
-            "precise, vivid English for a modern AI image generator.\n\n"
-            "IMPORTANT:\n"
-            "1. Preserve the user's exact meaning, subjects, actions, setting, "
-            "clothing, colors, mood, camera/view, time, and important details.\n"
-            "2. If the request is Amharic, understand the Amharic meaning first; "
-            "do not translate word-for-word.\n"
-            "3. Do not invent major objects, people, events, or details that "
-            "the user did not request.\n"
-            "4. You may improve grammar and visual clarity.\n"
-            "5. Add useful visual phrasing only when it directly expresses the "
-            "user's intended description.\n"
-            "6. Keep proper names and requested text exactly when appropriate.\n"
-            "7. Return ONLY the final English image prompt.\n"
-            "8. No explanation, no quotation marks, no preamble.\n\n"
-            "USER PROMPT:\n" + prompt
-        )
+        translated = GoogleTranslator(
+            source="auto",
+            target="en"
+        ).translate(prompt)
 
-        response = call_gemini_with_retry(
-            client,
-            model="gemini-3.6-flash",
-            contents=instruction
-        )
-
-        translated = (response.text or "").strip()
-
-        return translated if translated else prompt
+        return translated.strip() if translated else prompt
 
     except Exception as error:
         print(
@@ -2071,7 +2079,7 @@ Do not use markdown symbols such as ** or ##.
 Start with a clear title, then organized paragraphs or numbered sections.
 Do not add commentary about being an AI.
 Return only the document content.
-"""
+""" + "\n\n" + current_time_context()
 
     if OPENROUTER_API_KEY:
         try:
@@ -2112,7 +2120,8 @@ Return only the document content.
             api_key=GEMINI_API_KEY
         )
 
-        response = client.models.generate_content(
+        response = call_gemini_with_retry(
+            client,
             model="gemini-3.6-flash",
             contents=(
                 document_system_prompt
@@ -2953,16 +2962,15 @@ def reengagement_loop():
                 name = row["first_name"] or ""
 
                 reminder = (
-                    f"{name}, what’s wrong? Is everything okay? "
-"Use BOSSAI! If you have anything "
-"to share with me, please share it."
+                    f"Hey {name}, everything okay? "
+                    "Come use BOSSAI! Share "
+                    "whatever's on your mind."
                     if name
                     else
-                    "What's up? Is everything okay? "
-"Use BOSSAI! If you have anything "
-"to share, please share it with me."
+                    "Hey, everything okay? "
+                    "Come use BOSSAI! Share "
+                    "whatever's on your mind."
                 )
-
                 try:
                     bot.send_message(
                         row["user_id"],
