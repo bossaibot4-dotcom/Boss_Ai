@@ -461,7 +461,8 @@ def current_time_context():
 def call_gemini_with_retry(client, **kwargs):
     if "config" not in kwargs:
         kwargs["config"] = types.GenerateContentConfig(
-            max_output_tokens=8192
+            max_output_tokens=8192,
+            thinking_config=types.ThinkingConfig(thinking_level="LOW")
         )
 
     try:
@@ -625,6 +626,16 @@ def notify_admin_error(context, user_id, error):
         )
     except Exception as notify_error:
         print("Could not notify admin:", notify_error)
+
+
+def notify_admin(text):
+    if ADMIN_ID == 0:
+        return
+
+    try:
+        bot.send_message(ADMIN_ID, text)
+    except Exception as error:
+        print("Could not notify admin:", error)
 
 
 def typing_loop(chat_id, stop_event):
@@ -1812,9 +1823,6 @@ def process_image_prompt(message):
 
         english_prompt = translate_prompt_to_english(prompt)
 
-        print("Original image prompt:", prompt)
-        print("Optimized English image prompt:", english_prompt)
-
         image_bytes = generate_image(
             english_prompt
         )
@@ -2912,8 +2920,137 @@ def startup_diagnostic():
         )
 
 
-if __name__ == "__main__":
-    init_database()
-    startup_diagnostic()
+REENGAGEMENT_IDLE_SECONDS = 6 * 60 * 60
+REENGAGEMENT_CHECK_INTERVAL = 30 * 60
+
+
+def reengagement_loop():
+    while True:
+        try:
+            now = int(time.time())
+            cutoff = (
+                now - REENGAGEMENT_IDLE_SECONDS
+            )
+
+            conn = get_db()
+
+            rows = conn.execute(
+                """
+                SELECT user_id, first_name
+                FROM users
+                WHERE last_active IS NOT NULL
+                  AND last_active <= ?
+                  AND reminder_sent_at IS NULL
+                """,
+                (cutoff,)
+            ).fetchall()
+
+            conn.close()
+
+            for row in rows:
+                name = row["first_name"] or ""
+
+                reminder = (
+                    f"Hey {name}, everything okay? "
+                    "Come use BOSSAI! Share "
+                    "whatever's on your mind."
+                    if name
+                    else
+                    "Hey, everything okay? "
+                    "Come use BOSSAI! Share "
+                    "whatever's on your mind."
+                )
+                try:
+                    bot.send_message(
+                        row["user_id"],
+                        reminder
+                    )
+
+                except Exception as error:
+                    print(
+                        "Reengagement send failed for",
+                        row["user_id"],
+                        ":",
+                        error
+                    )
+
+                conn = get_db()
+
+                conn.execute(
+                    """
+                    UPDATE users
+                    SET reminder_sent_at=?
+                    WHERE user_id=?
+                    """,
+                    (now, row["user_id"])
+                )
+
+                conn.commit()
+                conn.close()
+
+        except Exception as error:
+            print(
+                "Reengagement loop error:",
+                error
+            )
+            traceback.print_exc()
+
+        time.sleep(
+            REENGAGEMENT_CHECK_INTERVAL
+        )
+
+
+def main():
+    try:
+        init_database()
+
+    except Exception as error:
+        print(
+            "Database init error:",
+            error
+        )
+        notify_admin(
+            "BOSSAI failed to initialize the database:\n"
+            + str(error)[:500]
+        )
+
     print("BOSSAI is running...")
-    bot.infinity_polling(timeout=60, long_polling_timeout=60)
+
+    try:
+        bot.remove_webhook()
+    except Exception as error:
+        print(
+            "Could not remove webhook:",
+            error
+        )
+
+    startup_diagnostic()
+
+    reengagement_thread = threading.Thread(
+        target=reengagement_loop,
+        daemon=True
+    )
+    reengagement_thread.start()
+
+    while True:
+        try:
+            bot.polling(none_stop=True, interval=0, timeout=20)
+
+        except Exception as error:
+            print(
+                "Polling error:",
+                error
+            )
+            traceback.print_exc()
+
+            notify_admin(
+                "BOSSAI polling stopped with an error "
+                "and is retrying:\n"
+                + str(error)[:500]
+            )
+
+            time.sleep(5)
+
+
+if __name__ == "__main__":
+    main()
