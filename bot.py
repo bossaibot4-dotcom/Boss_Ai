@@ -461,8 +461,7 @@ def current_time_context():
 def call_gemini_with_retry(client, **kwargs):
     if "config" not in kwargs:
         kwargs["config"] = types.GenerateContentConfig(
-            max_output_tokens=8192,
-            thinking_config=types.ThinkingConfig(thinking_level="LOW")
+            max_output_tokens=8192
         )
 
     try:
@@ -546,7 +545,7 @@ def ask_gemini(user_id, text):
 
     response = call_gemini_with_retry(
         client,
-        model="gemini-3.6-flash",
+        model="gemini-2.5-flash",
         contents=prompt
     )
 
@@ -592,9 +591,6 @@ def ask_openrouter_model(user_id, text, model_name):
 
 
 def ask_ai(user_id, text):
-    # Gemini is always the primary model. We intentionally do not save a
-    # fallback choice, so the next request tries Gemini again automatically.
-    # If Gemini is unavailable/quota-limited, continue silently through the chain.
     fallback_chain = ["Gemini", "Claude", "Grok", "DeepSeek", "GPT-4o"]
     errors = []
 
@@ -612,8 +608,6 @@ def ask_ai(user_id, text):
             print(f"{model_name} failed; trying next model:", error)
             continue
 
-    # Never expose provider/API errors to users. The admin notification layer
-    # receives the real exception from the caller.
     raise RuntimeError("All AI providers are temporarily unavailable.")
 
 
@@ -631,16 +625,6 @@ def notify_admin_error(context, user_id, error):
         )
     except Exception as notify_error:
         print("Could not notify admin:", notify_error)
-
-
-def notify_admin(text):
-    if ADMIN_ID == 0:
-        return
-
-    try:
-        bot.send_message(ADMIN_ID, text)
-    except Exception as error:
-        print("Could not notify admin:", error)
 
 
 def typing_loop(chat_id, stop_event):
@@ -1056,7 +1040,7 @@ def handle_vision_photo(message):
 
         response = call_gemini_with_retry(
             client,
-            model="gemini-3.6-flash",
+            model="gemini-2.5-flash",
             contents=[
                 system_prompt(user["notes"] or "") + "\n\n" + question,
                 image_part
@@ -1516,7 +1500,7 @@ def extract_pdf_text(pdf_bytes):
 
     response = call_gemini_with_retry(
         client,
-        model="gemini-3.6-flash",
+        model="gemini-2.5-flash",
         contents=[
             "Extract and return the full readable text content of this document, "
             "preserving its structure (headings, sections, lists). "
@@ -1661,14 +1645,6 @@ def document_upload_handler(message):
 
 
 def translate_prompt_to_english(prompt):
-    """
-    Convert an Amharic/non-English image prompt into English using a
-    dedicated, keyless translation service (deep-translator / Google
-    Translate). This is intentionally independent of the Gemini API so
-    image generation keeps working even if chat's Gemini quota is busy,
-    and so the translation is a faithful, literal conversion rather than
-    a creative LLM rewrite that can drift from what the user asked for.
-    """
     try:
         from deep_translator import GoogleTranslator
 
@@ -1688,7 +1664,6 @@ def translate_prompt_to_english(prompt):
 
 
 def generate_image(prompt):
-    # Primary free/keyless service.
     try:
         encoded_prompt = requests.utils.quote(prompt)
 
@@ -1721,7 +1696,6 @@ def generate_image(prompt):
             error
         )
 
-    # OpenRouter fallback.
     if not OPENROUTER_API_KEY:
         raise RuntimeError(
             "Free image generation failed and "
@@ -2129,7 +2103,7 @@ Return only the document content.
 
         response = call_gemini_with_retry(
             client,
-            model="gemini-3.6-flash",
+            model="gemini-2.5-flash",
             contents=(
                 document_system_prompt
                 + "\n\nRequest:\n"
@@ -2938,141 +2912,8 @@ def startup_diagnostic():
         )
 
 
-REENGAGEMENT_IDLE_SECONDS = 6 * 60 * 60
-REENGAGEMENT_CHECK_INTERVAL = 30 * 60
-
-
-def reengagement_loop():
-    while True:
-        try:
-            now = int(time.time())
-            cutoff = (
-                now - REENGAGEMENT_IDLE_SECONDS
-            )
-
-            conn = get_db()
-
-            rows = conn.execute(
-                """
-                SELECT user_id, first_name
-                FROM users
-                WHERE last_active IS NOT NULL
-                  AND last_active <= ?
-                  AND reminder_sent_at IS NULL
-                """,
-                (cutoff,)
-            ).fetchall()
-
-            conn.close()
-
-            for row in rows:
-                name = row["first_name"] or ""
-
-                reminder = (
-                    f"Hey {name}, everything okay? "
-                    "Come use BOSSAI! Share "
-                    "whatever's on your mind."
-                    if name
-                    else
-                    "Hey, everything okay? "
-                    "Come use BOSSAI! Share "
-                    "whatever's on your mind."
-                )
-                try:
-                    bot.send_message(
-                        row["user_id"],
-                        reminder
-                    )
-
-                except Exception as error:
-                    print(
-                        "Reengagement send failed for",
-                        row["user_id"],
-                        ":",
-                        error
-                    )
-
-                conn = get_db()
-
-                conn.execute(
-                    """
-                    UPDATE users
-                    SET reminder_sent_at=?
-                    WHERE user_id=?
-                    """,
-                    (now, row["user_id"])
-                )
-
-                conn.commit()
-                conn.close()
-
-        except Exception as error:
-            print(
-                "Reengagement loop error:",
-                error
-            )
-            traceback.print_exc()
-
-        time.sleep(
-            REENGAGEMENT_CHECK_INTERVAL
-        )
-
-
-def main():
-    try:
-        init_database()
-
-    except Exception as error:
-        print(
-            "Database init error:",
-            error
-        )
-        notify_admin(
-            "BOSSAI failed to initialize the database:\n"
-            + str(error)[:500]
-        )
-
-    print("BOSSAI is running...")
-
-    try:
-        bot.remove_webhook()
-    except Exception as error:
-        print(
-            "Could not remove webhook:",
-            error
-        )
-
-    startup_diagnostic()
-
-    reengagement_thread = threading.Thread(
-        target=reengagement_loop,
-        daemon=True
-    )
-    reengagement_thread.start()
-
-    while True:
-        try:
-            bot.infinity_polling(
-                skip_pending=True,
-                timeout=30,
-                long_polling_timeout=30
-            )
-
-        except Exception as error:
-            print(
-                "Polling error:",
-                error
-            )
-            traceback.print_exc()
-
-            notify_admin(
-                "BOSSAI polling stopped with an error "
-                "and is retrying:\n"
-                + str(error)[:500]
-            )
-
-            time.sleep(5)
-
-
 if __name__ == "__main__":
-    main()
+    init_database()
+    startup_diagnostic()
+    print("BOSSAI is running...")
+    bot.infinity_polling(timeout=60, long_polling_timeout=60)
